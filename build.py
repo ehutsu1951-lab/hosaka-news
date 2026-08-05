@@ -11,17 +11,24 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import urljoin
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 
 BLOG_URL = CONFIG["blog_url"].rstrip("/")
 FEEDS = [BLOG_URL + "/feed", BLOG_URL + "/rss"]
-UA = "Mozilla/5.0 (compatible; HosakaHatenaGitHubPages/2.0)"
+UA = "Mozilla/5.0 (compatible; HosakaHatenaGitHubPages/3.0)"
 
 
 def fetch(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
     with urllib.request.urlopen(req, timeout=30) as response:
         return response.read()
 
@@ -61,16 +68,59 @@ def clean_text(value: str) -> str:
     return value[:130] + "…" if len(value) > 130 else value
 
 
-def first_image(value: str) -> str:
+def first_image_from_html(value: str) -> str:
     patterns = [
         r'<img[^>]+src=["\']([^"\']+)["\']',
         r'<img[^>]+data-src=["\']([^"\']+)["\']',
         r'https?://cdn-ak\.f\.st-hatena\.com/images/fotolife/[^"\'>\s]+',
     ]
     for pattern in patterns:
-        match = re.search(pattern, value or "", flags=re.I)
-        if match:
-            return html.unescape(match.group(1) if match.lastindex else match.group(0))
+        m = re.search(pattern, value or "", flags=re.I)
+        if m:
+            return html.unescape(m.group(1) if m.lastindex else m.group(0))
+    return ""
+
+
+def image_from_article_page(url: str) -> str:
+    try:
+        page = fetch(url).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+    meta_patterns = [
+        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image(?::src)?["\']',
+    ]
+
+    for pattern in meta_patterns:
+        m = re.search(pattern, page, flags=re.I)
+        if m:
+            img = html.unescape(m.group(1)).strip()
+            if img and not img.startswith("data:"):
+                return urljoin(url, img)
+
+    body_patterns = [
+        r'<div[^>]+class=["\'][^"\']*entry-content[^"\']*["\'][\s\S]*?<img[^>]+src=["\']([^"\']+)["\']',
+        r'<article[\s\S]*?<img[^>]+src=["\']([^"\']+)["\']',
+    ]
+
+    for pattern in body_patterns:
+        m = re.search(pattern, page, flags=re.I)
+        if m:
+            img = html.unescape(m.group(1)).strip()
+            if img and not img.startswith("data:"):
+                return urljoin(url, img)
+
+    m = re.search(
+        r'https?://cdn-ak\.f\.st-hatena\.com/images/fotolife/[^"\'<>\s]+',
+        page,
+        flags=re.I,
+    )
+    if m:
+        return html.unescape(m.group(0))
+
     return ""
 
 
@@ -80,7 +130,7 @@ def make_article(title: str, url: str, published: str, body: str) -> dict:
         "url": url,
         "date": parse_date(published),
         "description": clean_text(body),
-        "image": first_image(body),
+        "image": first_image_from_html(body),
     }
 
 
@@ -90,7 +140,8 @@ def parse_feed(data: bytes) -> list[dict]:
     articles: list[dict] = []
 
     if kind == "feed":
-        entries = [item for item in root if local_name(item.tag) == "entry"]
+        entries = [x for x in root if local_name(x.tag) == "entry"]
+
         for entry in entries:
             title = child_text(entry, ("title",))
             published = child_text(entry, ("published", "updated"))
@@ -114,13 +165,13 @@ def parse_feed(data: bytes) -> list[dict]:
 
     elif kind == "rss":
         channel = next(
-            (item for item in root if local_name(item.tag) == "channel"),
+            (x for x in root if local_name(x.tag) == "channel"),
             None,
         )
         if channel is None:
             raise RuntimeError("RSS channel not found")
 
-        entries = [item for item in channel if local_name(item.tag) == "item"]
+        entries = [x for x in channel if local_name(x.tag) == "item"]
         for entry in entries:
             articles.append(
                 make_article(
@@ -139,17 +190,41 @@ def target_months(today: dt.date) -> list[tuple[int, int]]:
     return [(previous.year, previous.month), (today.year, today.month)]
 
 
+def fill_missing_images(articles: list[dict]) -> None:
+    today = dt.datetime.now(
+        dt.timezone(dt.timedelta(hours=9))
+    ).date()
+
+    wanted = set(target_months(today))
+
+    candidates = [
+        a for a in articles
+        if (a["date"].year, a["date"].month) in wanted
+    ]
+    candidates.sort(key=lambda a: a["date"], reverse=True)
+
+    limit = int(CONFIG.get("max_articles_per_month", 20)) * 2
+
+    for article in candidates[:limit]:
+        if not article.get("image"):
+            article["image"] = image_from_article_page(article["url"])
+
+
 def article_card(article: dict) -> str:
-    image_html = (
-        f'<img class="thumbnail" src="{html.escape(article["image"], quote=True)}" '
-        f'alt="" loading="lazy" referrerpolicy="no-referrer">'
-        if article["image"]
-        else '<div class="thumbnail no-image">画像なし</div>'
-    )
+    if article.get("image"):
+        image_html = (
+            f'<img class="thumbnail" '
+            f'src="{html.escape(article["image"], quote=True)}" '
+            f'alt="" loading="lazy">'
+        )
+    else:
+        image_html = '<div class="thumbnail no-image">画像なし</div>'
 
     return f"""
-<a class="article-card" href="{html.escape(article['url'], quote=True)}"
+<a class="article-card"
+   href="{html.escape(article['url'], quote=True)}"
    target="_blank" rel="noopener noreferrer">
+
   <div class="profile-row">
     <div class="avatar">保</div>
     <div>
@@ -176,20 +251,27 @@ def article_card(article: dict) -> str:
 def build_page(articles: list[dict]) -> str:
     sections = []
 
-    for year, month in target_months(
-        dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).date()
-    ):
+    today = dt.datetime.now(
+        dt.timezone(dt.timedelta(hours=9))
+    ).date()
+
+    for year, month in target_months(today):
         monthly = [
-            article
-            for article in articles
-            if article["date"].year == year and article["date"].month == month
+            a for a in articles
+            if a["date"].year == year and a["date"].month == month
         ]
-        monthly.sort(key=lambda article: article["date"], reverse=True)
+
+        monthly.sort(key=lambda a: a["date"], reverse=True)
         monthly = monthly[: int(CONFIG.get("max_articles_per_month", 20))]
 
-        cards = "".join(article_card(article) for article in monthly)
+        cards = "".join(article_card(a) for a in monthly)
+
         if not cards:
-            cards = f'<div class="empty">{year}年{month}月の記事はありません。</div>'
+            cards = (
+                f'<div class="empty">'
+                f'{year}年{month}月の記事はありません。'
+                f'</div>'
+            )
 
         sections.append(
             f"""
@@ -260,12 +342,22 @@ h2 {{
   color: #0b6ea8;
   font-weight: 700;
 }}
-.profile-name {{ color: #0878bf; font-weight: 700; }}
-.profile-id {{ color: #666; font-size: 13px; }}
-.hatena {{ margin-left: auto; color: #888; font-size: 13px; }}
+.profile-name {{
+  color: #0878bf;
+  font-weight: 700;
+}}
+.profile-id {{
+  color: #666;
+  font-size: 13px;
+}}
+.hatena {{
+  margin-left: auto;
+  color: #888;
+  font-size: 13px;
+}}
 .article-content {{
   display: grid;
-  grid-template-columns: minmax(0,1fr) 110px;
+  grid-template-columns: minmax(0,1fr) 130px;
   gap: 15px;
 }}
 h3 {{
@@ -280,10 +372,10 @@ p {{
   line-height: 1.7;
 }}
 .thumbnail {{
-  width: 110px;
-  height: 110px;
+  width: 130px;
+  height: 130px;
   object-fit: cover;
-  border-radius: 4px;
+  border-radius: 5px;
   background: #eee;
 }}
 .no-image {{
@@ -292,8 +384,17 @@ p {{
   color: #888;
   font-size: 12px;
 }}
-.date {{ margin-top: 14px; color: #777; font-size: 13px; }}
-.read-more {{ margin-top: 7px; color: #0878bf; font-size: 13px; font-weight: 700; }}
+.date {{
+  margin-top: 14px;
+  color: #777;
+  font-size: 13px;
+}}
+.read-more {{
+  margin-top: 7px;
+  color: #0878bf;
+  font-size: 13px;
+  font-weight: 700;
+}}
 .empty {{
   padding: 30px 15px;
   text-align: center;
@@ -309,9 +410,17 @@ p {{
   font-size: 12px;
 }}
 @media (max-width: 760px) {{
-  main {{ grid-template-columns: 1fr; gap: 32px; }}
-  .article-content {{ grid-template-columns: minmax(0,1fr) 90px; }}
-  .thumbnail {{ width: 90px; height: 90px; }}
+  main {{
+    grid-template-columns: 1fr;
+    gap: 32px;
+  }}
+  .article-content {{
+    grid-template-columns: minmax(0,1fr) 95px;
+  }}
+  .thumbnail {{
+    width: 95px;
+    height: 95px;
+  }}
 }}
 </style>
 </head>
@@ -340,10 +449,13 @@ def main() -> None:
     if not articles:
         raise RuntimeError(f"フィード取得失敗: {last_error}")
 
+    fill_missing_images(articles)
+
     (ROOT / "index.html").write_text(
         build_page(articles),
         encoding="utf-8",
     )
+
     print("updated", len(articles))
 
 

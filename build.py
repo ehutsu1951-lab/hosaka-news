@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent
 CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 
 BLOG_URL = CONFIG["blog_url"].rstrip("/")
-FEEDS = [BLOG_URL + "/feed", BLOG_URL + "/rss"]
+FEEDS = [BLOG_URL + "/feed?size=100", BLOG_URL + "/rss?size=100"]
 UA = "Mozilla/5.0 (compatible; HosakaHatenaGitHubPages/3.0)"
 
 
